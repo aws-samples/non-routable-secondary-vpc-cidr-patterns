@@ -1,0 +1,622 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 
+  Creates a VPC that spans 2 AZs in us-east-1 with an optional non-routable set of subnets. 
+  By default, it deploys a TGW subnet using a non-routable CIDR. It also supports an optional set of non-routable workload subnets 
+  that could support an EKS deployment.
+  Also, this template supports an option to use Ingress Routing with a GWLB for centralized ingress firewalls. 
+
+Parameters:
+  UseIngressRouting:
+    Type: String
+    Description: "true to create the VPC to support ingress routing to centralized firewalls. false otherwise"
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+  IngressFirewallGWLBEServiceName:
+    Type: String
+    Description: The VPC PrivateLink Service Name for the GWLB for the Ingress Firewall. Only specify if UseIngressRouting is true.
+
+  CreateNonRoutableWorkloadSubnets:
+    Type: String
+    Description: "true to create an additional non-routable subnets for workloads (EKS for example), false otherwise"
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+  LogsRetentionInDays:
+    Type: Number
+    Description: The number of days for cloud watch log group retention
+    Default: 365
+
+  VpcCIDR:
+    Type: String
+    Description: The routable CIDR for the VPC
+    Default: '10.100.0.0/23'
+  
+  PublicSubnetAZ1CIDR:
+    Type: String
+    Description: The routable CIDR for public subnet in AZ1
+    Default: '10.100.0.0/26'
+  PublicSubnetAZ2CIDR:
+    Type: String
+    Description: The routable CIDR for public subnet in AZ2
+    Default: '10.100.0.64/26'
+
+  PrivateSubnetAZ1CIDR:
+    Type: String
+    Description: The routable CIDR for private subnet in AZ1
+    Default: '10.100.0.128/25'
+  PrivateSubnetAZ2CIDR:
+    Type: String
+    Description: The routable CIDR for private subnet in AZ2
+    Default: '10.100.1.0/25'
+
+  TransitGatewayId:
+    Type: String
+    Description: The ID of the TGW
+
+Conditions:
+  HasIngressRouting: !Equals [ !Ref UseIngressRouting, "true" ]
+  
+  HasNonRoutableWorkloadSubnets: !Equals [ !Ref CreateNonRoutableWorkloadSubnets, "true" ]
+
+Mappings:
+  NonRoutable:
+    VPC:
+      SecondaryVPCCIDR: "198.18.0.0/16"
+    TGWSubnetCIDRs:
+      NonRoutablePrivateSubnetAZ1CIDR: "198.18.0.0/28"
+      NonRoutablePrivateSubnetAZ2CIDR: "198.18.0.32/28"
+    GWLBESubnetCIDRs:
+      NonRoutablePrivateSubnetAZ1CIDR: "198.18.0.16/28"
+      NonRoutablePrivateSubnetAZ2CIDR: "198.18.0.48/28"
+    WorkloadCIDRs:
+      NonRoutablePrivateSubnetAZ1CIDR: "198.18.64.0/18"
+      NonRoutablePrivateSubnetAZ2CIDR: "198.18.128.0/18"
+  AZIds:
+    us-east-1:
+      AZ1: "use1-az6"
+      AZ2: "use1-az1"
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-${AWS::Region}
+
+  NonRoutableCidrBlock:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [ NonRoutable, VPC, SecondaryVPCCIDR ]
+
+  VPCFlow:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt IamRoleForFlowLogs.Arn
+      LogGroupName: !Sub /aws/vpcflow/${VPC}
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogFormat: "${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${pkt-srcaddr} ${pkt-dstaddr}"
+
+  VPCFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vpcflow/${VPC}
+      RetentionInDays: !Ref LogsRetentionInDays
+
+  IamRoleForFlowLogs:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: allow-access-to-cw-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpcflow/*
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join ['-', [!Ref "AWS::StackName", "igw" ]]
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref IGW
+      VpcId: !Ref VPC
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGW:
+    Type: AWS::EC2::NatGateway
+    Properties: 
+      AllocationId: !GetAtt NatEIP.AllocationId
+      ConnectivityType: "public"
+      SubnetId: !Ref PublicSubnet1AZ1
+      Tags: 
+        - Key: Name
+          Value: !Join ['-', [!Ref "AWS::StackName", "natgw" ]]
+
+# ********************************************************************************
+# subnets
+  PublicSubnet1AZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetAZ1CIDR 
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ1 ] 
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-publicsubnet-az1"
+  PublicSubnet1AZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetAZ2CIDR
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ2 ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-publicsubnet-az2"
+
+  GWLBESubnetAZ1:
+    Condition: HasIngressRouting
+    DependsOn: NonRoutableCidrBlock
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [ NonRoutable, GWLBESubnetCIDRs, NonRoutablePrivateSubnetAZ1CIDR ]
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ1 ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-gwlbesubnet-az1"
+  GWLBESubnetAZ2:
+    Condition: HasIngressRouting
+    DependsOn: NonRoutableCidrBlock
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [ NonRoutable, GWLBESubnetCIDRs, NonRoutablePrivateSubnetAZ2CIDR ]
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ2 ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-gwlbesubnet-az2"
+
+  PrivateSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetAZ1CIDR
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ1 ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-privatesubnet-az1"
+  PrivateSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetAZ2CIDR
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ2 ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-privatesubnet-az2"
+
+  TgwSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    DependsOn: NonRoutableCidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [ NonRoutable, TGWSubnetCIDRs, NonRoutablePrivateSubnetAZ1CIDR ]
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ1 ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-tgwsubnet-az1"
+  TgwSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    DependsOn: NonRoutableCidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [ NonRoutable, TGWSubnetCIDRs, NonRoutablePrivateSubnetAZ2CIDR ]
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ2 ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-tgwsubnet-az2"
+
+# ********************************************************************************
+# Create TGW Attachment
+  TGWAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties: 
+      SubnetIds: 
+        - !Ref TgwSubnetAZ1
+        - !Ref TgwSubnetAZ2
+      TransitGatewayId: !Ref TransitGatewayId
+      Tags:
+        - Key: "Name"
+          Value: !Ref AWS::StackName
+      VpcId: !Ref VPC
+
+# ********************************************************************************
+# Route tables
+  IGWEdgeRouteTable:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-igw-edge"
+
+  PublicRouteTableAZ1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-public-az1"
+  PublicRouteTableAZ2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-public-az2"
+
+  GWLBERouteTable:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-gwlbe"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-private"
+
+  TgwRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-tgw"
+
+# ********************************************************************************
+# Route table associations
+  IGWEdgeRouteTableAssociation:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::GatewayRouteTableAssociation
+    Properties:
+      GatewayId: !Ref IGW
+      RouteTableId: !Ref IGWEdgeRouteTable
+
+  PublicRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1AZ1
+      RouteTableId: !Ref PublicRouteTableAZ1
+  PublicRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1AZ2
+      RouteTableId: !Ref PublicRouteTableAZ2
+
+  GWLBERouteTableAssociation1:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref GWLBESubnetAZ1
+      RouteTableId: !Ref GWLBERouteTable
+  GWLBERouteTableAssociation2:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref GWLBESubnetAZ2
+      RouteTableId: !Ref GWLBERouteTable
+
+  Private1RouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetAZ1
+      RouteTableId: !Ref PrivateRouteTable
+  Private1RouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetAZ2
+      RouteTableId: !Ref PrivateRouteTable
+
+  TgwRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TgwSubnetAZ1
+      RouteTableId: !Ref TgwRouteTable
+  TgwRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TgwSubnetAZ2
+      RouteTableId: !Ref TgwRouteTable
+
+# ********************************************************************************
+# IGW Edge Routes
+  IGWEdgeRouteAZ1:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref IGWEdgeRouteTable
+      DestinationCidrBlock: !Ref PublicSubnetAZ1CIDR
+      VpcEndpointId: !Ref GWLBEAZ1
+  IGWEdgeRouteAZ2:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref IGWEdgeRouteTable
+      DestinationCidrBlock: !Ref PublicSubnetAZ2CIDR
+      VpcEndpointId: !Ref GWLBEAZ2
+
+# ********************************************************************************
+# GWLBE Subnet Routes
+  GWLBESubnetsRoute:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref GWLBERouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref IGW
+
+# ********************************************************************************
+# Public Routes
+  PublicDefaultRouteAZ1WithGWLB:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTableAZ1
+      DestinationCidrBlock: 0.0.0.0/0
+      VpcEndpointId: !Ref GWLBEAZ1
+  PublicDefaultRouteAZ2WithGWLB:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTableAZ2
+      DestinationCidrBlock: 0.0.0.0/0
+      VpcEndpointId: !Ref GWLBEAZ2
+
+  PublicDefaultRouteAZ1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTableAZ1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+  PublicDefaultRouteAZ2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTableAZ2
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+# ********************************************************************************
+# Routes to TGW
+  PublicSubnetAZ1ToTGW:
+    Type: AWS::EC2::Route
+    DependsOn: TGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTableAZ1
+      TransitGatewayId: !Ref TransitGatewayId
+      DestinationCidrBlock: "10.0.0.0/8"
+  PublicSubnetAZ2ToTGW:
+    Type: AWS::EC2::Route
+    DependsOn: TGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTableAZ2
+      TransitGatewayId: !Ref TransitGatewayId
+      DestinationCidrBlock: "10.0.0.0/8"
+
+  PrivateSubnetsToTGW:
+    Type: AWS::EC2::Route
+    DependsOn: TGWAttachment
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      TransitGatewayId: !Ref TransitGatewayId
+      DestinationCidrBlock: "10.0.0.0/8"
+
+# ********************************************************************************
+# Routes to NATGW
+  PrivateSubnetsToNATGW:
+    Type: AWS::EC2::Route
+    DependsOn: TGWAttachment
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      NatGatewayId: !Ref NatGW
+      DestinationCidrBlock: "0.0.0.0/0"
+
+# ********************************************************************************
+# S3 gateway endpoint routes
+  S3GatewayEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      RouteTableIds: 
+        - !Ref PublicRouteTableAZ1
+        - !Ref PublicRouteTableAZ2
+        - !Ref PrivateRouteTable
+        - !Ref TgwRouteTable
+        - !If 
+          - HasIngressRouting
+          - !Ref GWLBERouteTable
+          - !Ref AWS::NoValue
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Security VPC - Gateway Load Balancer Endpoint
+# ----------------------------------------------------------------------------------------------------------------------
+
+  GWLBEAZ1:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Ref IngressFirewallGWLBEServiceName
+      VpcEndpointType: GatewayLoadBalancer
+      SubnetIds: [ !Ref GWLBESubnetAZ1 ]
+
+  GWLBEAZ2:
+    Condition: HasIngressRouting
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Ref IngressFirewallGWLBEServiceName
+      VpcEndpointType: GatewayLoadBalancer
+      SubnetIds: [ !Ref GWLBESubnetAZ2 ]
+
+# ********************************************************************************
+# ********************************************************************************
+# ********************************************************************************
+# Non-Routable Subnets
+# ********************************************************************************
+  NRPrivateSubnetAZ1:
+    Condition: HasNonRoutableWorkloadSubnets
+    DependsOn: NonRoutableCidrBlock
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [ NonRoutable, WorkloadCIDRs, NonRoutablePrivateSubnetAZ1CIDR ]
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ1 ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-nrsubnet-az1"
+  NRPrivateSubnetAZ2:
+    Condition: HasNonRoutableWorkloadSubnets
+    DependsOn: NonRoutableCidrBlock
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [ NonRoutable, WorkloadCIDRs, NonRoutablePrivateSubnetAZ2CIDR ]
+      AvailabilityZoneId: !FindInMap [ AZIds, !Ref "AWS::Region", AZ2 ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-nrsubnet-az2"
+
+# ********************************************************************************
+# Route tables
+  NRPrivateRouteTableAZ1:
+    Condition: HasNonRoutableWorkloadSubnets
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-nrprivate-az1"
+
+  NRPrivateRouteTableAZ2:
+    Condition: HasNonRoutableWorkloadSubnets
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-nrprivate-az2"
+
+# ********************************************************************************
+# Route table associations
+  NRPrivate1RouteTableAssociation1:
+    Condition: HasNonRoutableWorkloadSubnets
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref NRPrivateSubnetAZ1
+      RouteTableId: !Ref NRPrivateRouteTableAZ1
+  NRPrivate1RouteTableAssociation2:
+    Condition: HasNonRoutableWorkloadSubnets
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref NRPrivateSubnetAZ2
+      RouteTableId: !Ref NRPrivateRouteTableAZ2
+
+# ********************************************************************************
+# Private Nat Gateway for non-routable range
+  PrivateNGWAZ1:
+    Condition: HasNonRoutableWorkloadSubnets
+    Type: AWS::EC2::NatGateway
+    Properties: 
+      ConnectivityType: private
+      SubnetId: !Ref PrivateSubnetAZ1
+      Tags: 
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-private-natgw-az1"
+
+  PrivateNGWAZ2:
+    Condition: HasNonRoutableWorkloadSubnets
+    Type: AWS::EC2::NatGateway
+    Properties: 
+      ConnectivityType: private
+      SubnetId: !Ref PrivateSubnetAZ2
+      Tags: 
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${AWS::Region}-private-natgw-az2"
+
+# ********************************************************************************
+# Routes to Private NATGW
+  PrivateSubnetsToNatAZ1:
+    Condition: HasNonRoutableWorkloadSubnets
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref NRPrivateRouteTableAZ1
+      NatGatewayId: !Ref PrivateNGWAZ1
+      DestinationCidrBlock: "0.0.0.0/0"
+
+  PrivateSubnetsToNatAZ2:
+    Condition: HasNonRoutableWorkloadSubnets
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref NRPrivateRouteTableAZ2
+      NatGatewayId: !Ref PrivateNGWAZ2
+      DestinationCidrBlock: "0.0.0.0/0"
+
+# ********************************************************************************
+# S3 gateway endpoint routes
+  NRS3GatewayEndpoint:
+    Condition: HasNonRoutableWorkloadSubnets
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      RouteTableIds: 
+        - !Ref NRPrivateRouteTableAZ1
+        - !Ref NRPrivateRouteTableAZ2
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC

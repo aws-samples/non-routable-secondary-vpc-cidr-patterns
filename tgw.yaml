@@ -1,0 +1,66 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates a TGW and TGW Route Table with a blackholed set of routes for non-routable CIDRs
+
+Parameters:
+  AmazonSideAsn:
+    Type: String
+    Description: The TGW Amazon side ASN.
+    Default: 64555
+
+Mappings:
+  NetworkConfiguration:
+    TransitGateway:
+      AutoAcceptSharedAttachments: "enable" 
+      DefaultRouteTableAssociation: "disable"
+      DefaultRouteTablePropagation: "disable"
+      DnsSupport: "enable" 
+      VpnEcmpSupport: "enable" 
+
+Resources:
+
+  AWSTransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      AmazonSideAsn: !Ref AmazonSideAsn
+      AutoAcceptSharedAttachments: !FindInMap [NetworkConfiguration, TransitGateway, AutoAcceptSharedAttachments]
+      DefaultRouteTableAssociation: !FindInMap [NetworkConfiguration, TransitGateway, DefaultRouteTableAssociation]
+      DefaultRouteTablePropagation: !FindInMap [NetworkConfiguration, TransitGateway, DefaultRouteTablePropagation]
+      DnsSupport: !FindInMap [NetworkConfiguration, TransitGateway, DnsSupport]
+      VpnEcmpSupport: !FindInMap [NetworkConfiguration, TransitGateway, VpnEcmpSupport]
+      Tags:
+        - Key: Name
+          Value: !Sub tgw-${AWS::Region}
+
+  SandboxTGWRouteTable:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref AWSTransitGateway
+      Tags:
+        -
+          Key: Name
+          Value: sandbox-route-domain
+
+  ########################################
+  # TGW Blackhole routes for non-routable CIDRs
+  ########################################
+  # We need to blackhole 198.18.0.0/16, because VPC propagations are going to add in propagated routes.
+  # To do so, we add a more specific /17 route to effectively blackhole.
+  BlackholeNonRoutableProd1:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties: 
+      Blackhole: true
+      DestinationCidrBlock: "198.18.0.0/17"
+      TransitGatewayRouteTableId: !Ref SandboxTGWRouteTable
+  BlackholeNonRoutableProd2:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties: 
+      Blackhole: true
+      DestinationCidrBlock: "198.18.128.0/17"
+      TransitGatewayRouteTableId: !Ref SandboxTGWRouteTable
+
+Outputs:
+  TGWId:
+    Value: !Ref AWSTransitGateway
