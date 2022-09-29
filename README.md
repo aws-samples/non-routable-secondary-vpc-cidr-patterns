@@ -1,6 +1,7 @@
 # Non Routable Secondary CIDR Patterns
 
-This repo contains sample files to demonstrate how secondary non-routable CIDRs can be used on VPCs for non-workload subnets including TGW subnets and GWLB endpoint subnets.
+This repo contains sample files to demonstrate how secondary non-routable CIDRs can be used on VPCs for non-workload subnets including TGW subnets and GWLB endpoint subnets. This is a sample implementation from [AWS prescriptive guidance](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/preserve-routable-ip-space-in-multi-account-vpc-designs-for-non-workload-subnets.html).
+
 
 
 ## Lab set up
